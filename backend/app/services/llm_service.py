@@ -1,0 +1,270 @@
+import re
+from typing import Dict, Any, Optional, List
+import os
+from litellm import acompletion
+import litellm
+
+# Disable LiteLLM callbacks and telemetry to prevent logging worker timeouts
+os.environ["LITELLM_TELEMETRY"] = "FALSE"
+litellm.success_callback = []
+litellm.failure_callback = []
+litellm.callbacks = []
+
+JUDGE_PROMPT_PREFIX = """You are an expert evaluator tasked with assessing outputs according to specific criteria. Your role is to provide objective, consistent, and well-reasoned evaluations.
+
+## What You're Evaluating
+
+You will be evaluating the OUTPUT provided below. The output is the response that needs to be assessed for quality.
+
+OUTPUT:
+{{Output}}
+
+## Evaluation Criteria
+
+Apply the following criteria to evaluate the output above:
+
+"""
+
+JUDGE_PROMPT_SUFFIX = """
+
+## Evaluation Guidelines
+
+1. **Be Objective**: Base your evaluation solely on the output and criteria provided. Set aside personal biases.
+2. **Be Consistent**: Apply the same standards uniformly. Similar outputs should receive similar scores.
+3. **Be Thorough**: Consider all relevant aspects of the output before determining your score.
+4. **Be Fair**: Give credit where it's due, and be constructive in identifying shortcomings.
+5. **Be Specific**: Reference concrete aspects of the output in your analysis.
+
+## Response Format
+
+Structure your response as follows:
+
+1. **Analysis**: Analyze the output against the evaluation criteria. Discuss both strengths and weaknesses with specific examples from the output.
+2. **Reasoning**: Explain how you arrived at your score based on the criteria.
+3. **Score**: Provide your final numeric score in the required format.
+
+**REQUIRED SCORE FORMAT:**
+<score>NUMBER</score>
+
+Where NUMBER is a numeric score (e.g., 0.5, 1.0, 2.5, 3.75, 5.0, etc.). Use the scoring scale specified in the criteria above. If no scale is specified, use a binary 0/1 (0=fail, 1=pass).
+
+## Important
+
+- The score MUST be enclosed in `<score>` tags exactly as shown
+- Provide your analysis and reasoning BEFORE the score
+- Be specific and cite examples from the output
+- If the output is ambiguous or lacks information needed for evaluation, note this and score accordingly
+
+Begin your evaluation of the output now.
+"""
+
+
+class LLMService:
+    """Service for interacting with LLM providers via LiteLLM"""
+    
+    def render_prompt(
+        self, 
+        prompt_template: str, 
+        row_data: Dict[str, Any], 
+        available_columns: Optional[List[str]] = None
+    ) -> str:
+        """
+        Render a prompt template by replacing {{variable}} placeholders with actual values.
+        
+        Args:
+            prompt_template: Template string with {{variable}} syntax
+            row_data: Dictionary of column names to values
+            available_columns: Optional list of available column names for validation
+        
+        Returns:
+            Rendered prompt string
+        
+        Raises:
+            ValueError: If a column name in the template doesn't exist in available_columns
+        """
+        # Extract all column names from the template
+        column_names_in_template = re.findall(r'\{\{([^}]+)\}\}', prompt_template)
+        column_names_in_template = [name.strip() for name in column_names_in_template]
+        
+        # Validate column names if available_columns is provided
+        if available_columns is not None:
+            missing_columns = [col for col in column_names_in_template if col not in available_columns]
+            if missing_columns:
+                raise ValueError(
+                    f"Prompt template references columns that don't exist: {', '.join(missing_columns)}. "
+                    f"Available columns: {', '.join(available_columns)}"
+                )
+        
+        def replace_var(match):
+            var_name = match.group(1).strip()
+            # Get the value from row_data, default to empty string if not found
+            value = str(row_data.get(var_name, ""))
+            return value
+        
+        # Replace all {{variable}} patterns
+        rendered = re.sub(r'\{\{([^}]+)\}\}', replace_var, prompt_template)
+        return rendered
+    
+    async def completion(
+        self,
+        prompt: str,
+        model: str,
+        temperature: Optional[float] = None,
+        max_completion_tokens: Optional[int] = None,
+    ) -> str:
+        """
+        Get a completion from the LLM via LiteLLM (legacy method for backward compatibility).
+        
+        Args:
+            prompt: The prompt to send to the LLM
+            model: Any LiteLLM-supported model ID (e.g., 'gpt-4', 'azure/gpt-4', 'gemini/gemini-pro')
+            temperature: Temperature setting (defaults to 1.0)
+            max_completion_tokens: Maximum tokens to generate (defaults to 2000)
+        
+        Returns:
+            The complete response text from the LLM
+        """
+        # Use defaults if not provided
+        final_temperature = temperature if temperature is not None else 1.0
+        final_max_tokens = max_completion_tokens if max_completion_tokens is not None else 2000
+        
+        # Call LiteLLM directly - it handles everything!
+        response = await acompletion(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=final_temperature,
+            max_tokens=final_max_tokens,
+        )
+        
+        # Extract text from response
+        if response and response.choices and len(response.choices) > 0:
+            choice = response.choices[0]
+            if choice.message and choice.message.content:
+                return choice.message.content
+        
+        return ""
+    
+    async def chat_completion(
+        self,
+        system_prompt: str,
+        user_message: str,
+        model: str,
+        temperature: Optional[float] = None,
+        max_completion_tokens: Optional[int] = None,
+    ) -> str:
+        """
+        Get a completion from the LLM using chat format with system and user messages.
+        
+        Args:
+            system_prompt: The system prompt (can include {{variable}} syntax that will be rendered)
+            user_message: The user message content
+            model: Any LiteLLM-supported model ID (e.g., 'gpt-4', 'azure/gpt-4', 'gemini/gemini-pro')
+            temperature: Temperature setting (defaults to 1.0)
+            max_completion_tokens: Maximum tokens to generate (defaults to 2000)
+        
+        Returns:
+            The complete response text from the LLM
+        """
+        # Use defaults if not provided
+        final_temperature = temperature if temperature is not None else 1.0
+        final_max_tokens = max_completion_tokens if max_completion_tokens is not None else 2000
+        
+        # Validate inputs
+        if final_max_tokens < 1:
+            final_max_tokens = 2000
+        
+        # Build messages array with system and user roles
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        if user_message:
+            messages.append({"role": "user", "content": user_message})
+        
+        if not messages:
+            return ""
+        
+        # Call LiteLLM with chat format
+        response = await acompletion(
+            model=model,
+            messages=messages,
+            temperature=final_temperature,
+            max_tokens=final_max_tokens,
+        )
+        
+        # Extract text from response
+        if response and response.choices and len(response.choices) > 0:
+            choice = response.choices[0]
+            if choice.message and choice.message.content:
+                content = choice.message.content
+                if content and content.strip():
+                    return content.strip()
+        
+        return ""
+    
+    def build_judge_prompt(
+        self,
+        core_prompt: str,
+        row_data: Dict[str, Any],
+        available_columns: Optional[List[str]] = None
+    ) -> str:
+        """
+        Build a complete judge prompt by wrapping the core prompt with prefix and suffix,
+        then rendering all {{variable}} placeholders (including {{Output}} in the prefix).
+        
+        The prefix automatically includes the {{Output}} column, which contains the LLM-generated
+        response being evaluated. Users can reference other columns in their criteria for context.
+        
+        Args:
+            core_prompt: The user-provided judge criteria (may contain {{variable}} syntax)
+            row_data: Dictionary of column names to values (must include 'Output' column)
+            available_columns: Optional list of available column names for validation
+        
+        Returns:
+            Complete judge prompt string with all variables rendered
+        
+        Raises:
+            ValueError: If a column name in the template doesn't exist in available_columns
+        """
+        # Combine prefix + core prompt + suffix FIRST
+        complete_template = JUDGE_PROMPT_PREFIX + core_prompt + JUDGE_PROMPT_SUFFIX
+        
+        # Then render the entire template to substitute ALL {{variable}} placeholders
+        # This includes {{Output}} in the prefix and any variables in the core prompt
+        rendered_prompt = self.render_prompt(complete_template, row_data, available_columns)
+        
+        return rendered_prompt
+    
+    def parse_judge_score(self, output: str) -> float:
+        """
+        Parse a numeric score from LLM output that should contain <score>NUMBER</score>.
+        
+        Args:
+            output: The raw LLM output text
+        
+        Returns:
+            The parsed score as a float
+        
+        Raises:
+            ValueError: If no valid score is found in the expected format
+        """
+        # Look for <score>NUMBER</score> pattern
+        pattern = r'<score>\s*([+-]?\d*\.?\d+)\s*</score>'
+        match = re.search(pattern, output, re.IGNORECASE)
+        
+        if match:
+            try:
+                score = float(match.group(1))
+                return score
+            except ValueError:
+                raise ValueError(f"Could not parse score value: {match.group(1)}")
+        
+        # If no match found, raise an error
+        raise ValueError(
+            f"No valid score found in LLM output. Expected format: <score>NUMBER</score>. "
+            f"Output received: {output[:200]}..." if len(output) > 200 else f"Output received: {output}"
+        )
+
+
+# Global instance
+llm_service = LLMService()
+
