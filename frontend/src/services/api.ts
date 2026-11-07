@@ -1,6 +1,6 @@
 // API client functions
 // Use relative URL to leverage Vite proxy, or full URL if proxy not working
-const API_BASE_URL = '/api/v1';
+const API_BASE_URL = `${import.meta.env.VITE_API_URL || ''}/api/v1`;
 
 export interface CSVFile {
   id: number;
